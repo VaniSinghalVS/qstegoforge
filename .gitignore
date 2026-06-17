@@ -1,4 +1,12 @@
 venv/
 __pycache__/
 *.pyc
-.env
+
+raw_datasets/
+datasets/
+results/
+
+data/attacked/
+data/watermarked/
+
+src/__pycache__/

@@ -3,6 +3,7 @@ verifier.py — Watermark Extraction and Tamper Localization
 Extracts the embedded watermark from a watermarked image,
 verifies it against the original payload, and localizes
 any tampered regions using spatial mismatch patterns.
+Supports patch-tiling and frequency domain mode.
 """
 
 import sys
@@ -11,45 +12,88 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
+import math
 import config
-from src.neqr import preprocess_image, image_to_neqr
+from src.neqr import preprocess_image
 from src.kyber_crypto import (
     decrypt_watermark,
     generate_watermark_payload,
+    generate_position_seed,
     compute_image_hash,
     verify_shared_secrets
 )
-from src.embedder import select_embedding_positions, circuit_to_image
+from src.embedder import select_embedding_positions
 
+# -------------------------
+# Extraction Logic
+# -------------------------
 
-def extract_watermark_from_image(img: np.ndarray, positions: list) -> np.ndarray:
+def extract_from_patch_spatial(patch: np.ndarray, positions: list, depth: int = None) -> np.ndarray:
+    """Extract watermark bits from a 64x64 patch using majority vote across `depth` planes.
+    
+    When depth=1 (quantum modes), reads only bit-plane 0.
+    When depth=config.LSB_DEPTH (classical_spatial), uses majority vote across all planes.
     """
-    Extract watermark bits from a (possibly tampered) image
-    by reading the LSB of pixel values at the embedding positions.
-    """
-    height, width = img.shape
+    if depth is None:
+        depth = config.LSB_DEPTH
+    patch_h, patch_w = patch.shape
     extracted_bits = []
 
     for pos in positions:
-        row = pos // width
-        col = pos % width
-        if row < height and col < width:
-            pixel_value = int(img[row, col])
-            lsb = pixel_value & 1  # extract least significant bit
-            extracted_bits.append(lsb)
+        row = pos // patch_w
+        col = pos % patch_w
+        if row < patch_h and col < patch_w:
+            v = int(patch[row, col])
+            votes = sum((v >> plane) & 1 for plane in range(depth))
+            extracted_bits.append(1 if votes > depth // 2 else 0)
         else:
             extracted_bits.append(0)
 
     return np.array(extracted_bits, dtype=np.uint8)
 
+def extract_from_patch_frequency(patch: np.ndarray, positions: list) -> np.ndarray:
+    """
+    Extract watermark bits from 2D FFT mid-frequency coefficients.
+    """
+    patch_h, patch_w = patch.shape
+    fft_patch = np.fft.fftshift(np.fft.fft2(patch, norm="ortho"))
+    
+    # Identify mid-frequencies (radius 8 to 24)
+    center_y, center_x = patch_h // 2, patch_w // 2
+    candidates = []
+    
+    for y in range(patch_h):
+        for x in range(patch_w):
+            if y == center_y and x == center_x: continue # skip DC
+            # To preserve symmetry, only pick upper half plane (y < center_y) or (y == center_y and x > center_x)
+            if y < center_y or (y == center_y and x > center_x):
+                r = math.sqrt((y - center_y)**2 + (x - center_x)**2)
+                if 8 <= r <= 24:
+                    candidates.append((y, x))
+    
+    # Sort candidates for determinism
+    candidates.sort()
+    
+    # Use the random positions to select from candidates
+    # In frequency mode, 'positions' refers to indices within the candidates list
+    extracted_bits = []
+    delta = 20.0  # quantization step
+    
+    for pos in positions:
+        idx = pos % len(candidates)
+        cy, cx = candidates[idx]
+        val = np.real(fft_patch[cy, cx])
+        
+        # Quantization index
+        q_idx = math.floor(val / delta + 0.5)
+        bit = q_idx % 2
+        extracted_bits.append(int(bit))
+        
+    return np.array(extracted_bits, dtype=np.uint8)
+
 
 def compute_detection_rate(original_payload: np.ndarray,
                            extracted_payload: np.ndarray) -> float:
-    """
-    Compute the watermark detection rate as the fraction of bits
-    that match between original and extracted payloads.
-    """
     if len(original_payload) != len(extracted_payload):
         min_len = min(len(original_payload), len(extracted_payload))
         original_payload  = original_payload[:min_len]
@@ -60,95 +104,98 @@ def compute_detection_rate(original_payload: np.ndarray,
     return float(detection_rate)
 
 
-def localize_tampering(original_img: np.ndarray,
-                       watermarked_img: np.ndarray,
-                       positions: list,
-                       original_payload: np.ndarray,
-                       extracted_payload: np.ndarray) -> np.ndarray:
-    """
-    Produce a tamper localization map by marking pixels where
-    the extracted watermark bit does not match the original.
-    White = tampered, Black = authentic.
-    """
-    height, width = original_img.shape
-    tamper_map    = np.zeros((height, width), dtype=np.uint8)
+def verify_pipeline(watermarked_path: str, metadata: dict, embedding_mode: str = "quantum_spatial_shots_2048") -> dict:
+    print(f"\n=== QStegoForge Verification ({embedding_mode}) ===\n")
 
-    for idx, pos in enumerate(positions):
-        if idx >= len(original_payload) or idx >= len(extracted_payload):
-            break
-        if original_payload[idx] != extracted_payload[idx]:
-            row = pos // width
-            col = pos % width
-            if row < height and col < width:
-                tamper_map[row, col] = 255  # mark as tampered
-
-    return tamper_map
-
-
-def save_tamper_map(tamper_map: np.ndarray, output_path: str):
-    """Save the tamper localization map as an image."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cv2.imwrite(output_path, tamper_map)
-    print(f"[Verifier] Tamper map saved: {output_path}")
-
-
-def verify_pipeline(watermarked_path: str, metadata: dict) -> dict:
-    """
-    Full verification pipeline:
-    1. Load watermarked image
-    2. Decrypt watermark using Kyber private key
-    3. Reconstruct expected payload
-    4. Extract actual payload from image LSBs
-    5. Compare payloads and compute detection rate
-    6. Localize tampered regions
-    7. Return verification results
-    """
-    print("\n=== QStegoForge Verification Pipeline ===\n")
-
-    # Step 1: Load watermarked image
     img = preprocess_image(watermarked_path)
-    print(f"[Image]    Loaded: {watermarked_path} → shape {img.shape}")
+    height, width = img.shape
+    
+    patch_size = 64
+    n_patches_y = metadata["patch_grid"][0]
+    n_patches_x = metadata["patch_grid"][1]
+    n_patches = n_patches_y * n_patches_x
+    
+    # Pad if necessary
+    pad_h = (patch_size - height % patch_size) % patch_size
+    pad_w = (patch_size - width % patch_size) % patch_size
+    if pad_h > 0 or pad_w > 0:
+        img = np.pad(img, ((0, pad_h), (0, pad_w)), mode='constant')
 
-    # Step 2: Decrypt to recover shared secret
-    shared_secret = decrypt_watermark(metadata["private_key"],
-                                      metadata["ciphertext"])
-
-    # Step 3: Reconstruct expected payload
+    shared_secret = decrypt_watermark(metadata["private_key"], metadata["ciphertext"])
     expected_payload = generate_watermark_payload(shared_secret)
-    positions        = metadata["positions"]
-    print(f"[Kyber]    Shared secret recovered: {len(shared_secret)} bytes")
+    
+    extracted_bits_all = np.zeros_like(expected_payload)
+    votes = np.zeros(len(expected_payload), dtype=np.int32)
+    
+    tamper_map = np.zeros((n_patches_y * patch_size, n_patches_x * patch_size), dtype=np.uint8)
 
-    # Step 4: Extract actual payload from image
-    extracted_payload = extract_watermark_from_image(img, positions)
-    print(f"[Extract]  Extracted {len(extracted_payload)} bits from image LSBs")
-
-    # Step 5: Compute detection rate
+    for py in range(n_patches_y):
+        for px in range(n_patches_x):
+            patch_index = py * n_patches_x + px
+            y0, y1 = py * patch_size, (py + 1) * patch_size
+            x0, x1 = px * patch_size, (px + 1) * patch_size
+            patch = img[y0:y1, x0:x1]
+            
+            # Payload subset
+            start_idx = (patch_index * 8) % len(expected_payload)
+            end_idx = start_idx + 8
+            if end_idx <= len(expected_payload):
+                expected_patch = expected_payload[start_idx:end_idx]
+            else:
+                expected_patch = np.concatenate((expected_payload[start_idx:], expected_payload[:end_idx - len(expected_payload)]))
+                
+            seed = generate_position_seed(shared_secret, patch_index=patch_index)
+            
+            # Determine extraction method
+            if "frequency" in embedding_mode:
+                # Dynamically count candidates for the PRNG bound
+                candidates_count = 0
+                for y in range(patch_size):
+                    for x in range(patch_size):
+                        if y == patch_size//2 and x == patch_size//2: continue
+                        if y < patch_size//2 or (y == patch_size//2 and x > patch_size//2):
+                            r = math.sqrt((y - patch_size//2)**2 + (x - patch_size//2)**2)
+                            if 8 <= r <= 24:
+                                candidates_count += 1
+                                
+                positions = select_embedding_positions(seed, candidates_count, len(expected_patch))
+                extracted_patch = extract_from_patch_frequency(patch, positions)
+            else:
+                # Spatial mode — match extraction depth to embedding depth
+                # classical_spatial embeds into LSB_DEPTH planes; quantum modes embed only plane 0
+                extract_depth = config.LSB_DEPTH if "classical_spatial" in embedding_mode else 1
+                positions = select_embedding_positions(seed, patch_size*patch_size, len(expected_patch))
+                extracted_patch = extract_from_patch_spatial(patch, positions, depth=extract_depth)
+            
+            # Accumulate votes
+            for i, bit in enumerate(extracted_patch):
+                actual_idx = (start_idx + i) % len(expected_payload)
+                if bit == 1:
+                    votes[actual_idx] += 1
+                elif bit == 0:
+                    votes[actual_idx] -= 1
+                    
+            # Localize tampering on a per-patch basis
+            # If the patch payload does not match the expected patch payload
+            patch_dr = compute_detection_rate(expected_patch, extracted_patch)
+            if patch_dr < 1.0:
+                tamper_map[y0:y1, x0:x1] = 255
+                
+    # Finalize payload via majority vote
+    # Break ties to 0 (conservative default) to avoid silent misclassification of unvoted bits
+    extracted_payload = np.where(votes > 0, 1, 0).astype(np.uint8)
+    
     detection_rate = compute_detection_rate(expected_payload, extracted_payload)
-    print(f"[Metrics]  Detection rate: {detection_rate * 100:.2f}%")
-
-    # Step 6: Compute image hash and check integrity
-    current_hash   = compute_image_hash(img)
-    hash_match     = (current_hash == metadata["image_hash"])
-    print(f"[Hash]     Original hash : {metadata['image_hash'][:32]}...")
-    print(f"[Hash]     Current hash  : {current_hash[:32]}...")
-    print(f"[Hash]     Hash match    : {hash_match}")
-
-    # Step 7: Tamper localization
-    original_img = preprocess_image(watermarked_path)
-    tamper_map   = localize_tampering(
-        original_img, img, positions,
-        expected_payload, extracted_payload
-    )
-    tamper_pixels = np.sum(tamper_map > 0)
-    print(f"[Tamper]   Tampered pixels detected: {tamper_pixels}")
-
-    # Step 8: Save tamper map
-    save_tamper_map(tamper_map, "results/visualizations/tamper_map.png")
-
     is_authentic = detection_rate >= config.MIN_DETECTION
 
-    print(f"\n[Result]   Image is {'AUTHENTIC ✓' if is_authentic else 'TAMPERED ✗'}")
-    print("\n=== Verification Complete ===")
+    # Remove padding from tamper map
+    tamper_map = tamper_map[:height, :width]
+    tamper_pixels = np.sum(tamper_map > 0)
+    
+    # Compute integrity hash
+    img_cropped = img[:height, :width]
+    current_hash = compute_image_hash(img_cropped)
+    hash_match = (current_hash == metadata["image_hash"])
 
     return {
         "detection_rate"   : detection_rate,
@@ -158,20 +205,3 @@ def verify_pipeline(watermarked_path: str, metadata: dict) -> dict:
         "expected_payload" : expected_payload,
         "extracted_payload": extracted_payload
     }
-
-
-if __name__ == "__main__":
-    from src.embedder import embed_pipeline
-
-    # Embed first
-    test_input       = "data/input/test.png"
-    test_watermarked = "data/watermarked/test_watermarked.png"
-    metadata         = embed_pipeline(test_input, test_watermarked)
-
-    # Then verify
-    results = verify_pipeline(test_watermarked, metadata)
-
-    print(f"\nDetection rate : {results['detection_rate'] * 100:.2f}%")
-    print(f"Hash match     : {results['hash_match']}")
-    print(f"Tamper pixels  : {results['tamper_pixels']}")
-    print(f"Authentic      : {results['is_authentic']}")

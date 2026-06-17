@@ -1,0 +1,18 @@
+# QStegoForge — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Quantum computing
+qiskit>=1.0.0
+qiskit-aer>=0.14.0
+
+# Post-quantum cryptography (CRYSTALS-Kyber)
+kyber-py>=0.3.0
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Numerical / scientific
+numpy>=1.26.0
+scikit-image>=0.22.0
+matplotlib>=3.8.0
